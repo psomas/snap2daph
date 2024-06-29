@@ -1,11 +1,15 @@
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::prelude::*;
-use std::io::{BufReader, BufWriter};
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::{prelude::*, BufReader, BufWriter},
+};
 
 use clap::Parser;
 use itertools::Itertools;
-use serde_json::json;
+use serde::Serialize;
+use serde_json;
+
+mod df;
 
 const DELIMITERS: &str = ";, \t";
 
@@ -18,23 +22,61 @@ struct Args {
     #[arg(long)]
     output: String,
 
-    #[arg(long, value_name = "INFLATION_FACTOR")]
-    inflate: Option<usize>,
+    /* WIP: */
+    #[arg(long, value_name = "SCALING FACTOR")]
+    scale: Option<usize>,
 
+    /* WIP: */
     #[arg(long, value_name = "DENSIFICATION_FACTOR")]
     densify: Option<usize>,
 
     #[arg(long)]
     undirected: bool,
+
+    #[arg(long)]
+    daphne_serde: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct Metadata {
+    numRows: usize,
+    numCols: usize,
+    valueType: String,
+    numNonZeros: usize,
+}
+
+#[derive(Eq, Hash, PartialEq, Ord, PartialOrd, Copy, Clone)]
+struct Vertex(usize);
+
+impl From<Vertex> for usize {
+    fn from(v: Vertex) -> Self {
+        v.0
+    }
+}
+
+#[derive(Eq, Hash, PartialEq, Ord, PartialOrd, Copy, Clone)]
+struct Edge(Vertex, Vertex);
+
+impl Edge {
+    fn rev(&self) -> Self {
+        Self(self.1, self.0)
+    }
+}
+
+impl From<(usize, usize)> for Edge {
+    fn from(tuple: (usize, usize)) -> Self {
+        Edge(Vertex(tuple.0), Vertex(tuple.1))
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let input = BufReader::new(File::open(args.input)?);
-    let mut min_vertex = usize::MAX;
-    let mut edges: HashSet<(usize, usize)> = HashSet::new();
-    let mut vertices = HashSet::new();
+    let mut min = usize::MAX;
+    let mut max = 0;
+    let mut edges: HashSet<Edge> = HashSet::new();
+    let mut vertices: HashSet<Vertex> = HashSet::new();
 
     for line in input.lines() {
         let line = line?;
@@ -44,41 +86,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let edge = line
+        let edge: (usize, usize) = line
             .split(|c| DELIMITERS.contains(c))
             .map(|v| {
                 let v = v.parse::<usize>().unwrap();
-                vertices.insert(v);
-                if v < min_vertex {
-                    min_vertex = v;
+                vertices.insert(Vertex(v));
+                if v < min {
+                    min = v;
+                }
+                if v > max {
+                    max = v;
                 }
                 v
             })
             .collect_tuple()
             .ok_or("error parsing file")?;
 
+        let edge = edge.into();
         edges.insert(edge);
         if args.undirected {
-            edges.insert((edge.1, edge.0));
+            edges.insert(edge.rev());
         }
     }
 
-    let mut edges: Vec<_> = edges.iter().collect();
+    let mut vertices: Vec<_> = vertices.into_iter().collect();
+    vertices.sort();
+
+    let mut edges: Vec<_> = edges.into_iter().collect();
     edges.sort();
 
-    let mut output = BufWriter::new(File::create(&args.output)?);
-    for edge in &edges {
-        write!(output, "{},{}\n", edge.0 - min_vertex, edge.1 - min_vertex)?;
-    }
+    let meta = Metadata {
+        numRows: max - min,
+        numCols: max - min,
+        valueType: "f64".to_owned(),
+        numNonZeros: edges.len(),
+    };
 
-    let mut output_meta = BufWriter::new(File::create(format!("{}.meta", args.output))?);
-    let meta = json!({
-        "numRows": vertices.len(),
-        "numCols": vertices.len(),
-        "valueType": "f64",
-        "numNonZeros": edges.len(),
-    });
-    write!(output_meta, "{}", meta.to_string())?;
+    let mut meta_out = BufWriter::new(File::create(format!("{}.meta", args.output))?);
+    write!(meta_out, "{}", serde_json::to_string(&meta)?)?;
+
+    let mut out = BufWriter::new(File::create(&args.output)?);
+    if args.daphne_serde {
+        let ds = df::Serializer {
+            vertices,
+            edges,
+            meta,
+        };
+        ds.serialize(&mut out)?;
+    } else {
+        for edge in &edges {
+            write!(
+                out,
+                "{},{}\n",
+                usize::from(edge.0) - min,
+                usize::from(edge.1) - min
+            )?;
+        }
+    }
 
     Ok(())
 }
